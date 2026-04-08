@@ -433,10 +433,16 @@ class HumanoidAutoDetector:
                         continue
                     
                     # 只有同一父级下的两个子骨骼名字符合 L/R 差异时才计入
-                    if self.check_name_lr_diff(b1.name, b2.name):
+                    order = self.check_name_lr_diff(b1.name, b2.name)
+                    if order > 0:
                         pairs.append((b1, b2))
                         checked_in_this_parent.add(b1.name)
                         checked_in_this_parent.add(b2.name)
+                        break
+                    elif order < 0:
+                        pairs.append((b2, b1))
+                        checked_in_this_parent.add(b2.name)
+                        checked_in_this_parent.add(b1.name)
                         break
                         
         return pairs
@@ -450,7 +456,7 @@ class HumanoidAutoDetector:
         n2 = name2.lower()
 
         if n1 == n2:
-            return False
+            return 0
 
         # 1. 使用 SequenceMatcher 找出相同部分
         s = difflib.SequenceMatcher(None, n1, n2)
@@ -483,10 +489,12 @@ class HumanoidAutoDetector:
             lr_pairs = [("l", "r"), ("lef", "righ")]
             
             for l_str, r_str in lr_pairs:
-                if (d1 == l_str and d2 == r_str) or (d1 == r_str and d2 == l_str):
-                    return True
+                if d1 == l_str and d2 == r_str:
+                    return 1
+                if d1 == r_str and d2 == l_str:
+                    return -1
 
-        return False
+        return 0
 
     def check_hand_chain_consistency(self, lengths):
         """逻辑：所有链长相同，或者只有一个链长度比其他少 1"""
@@ -498,22 +506,28 @@ class HumanoidAutoDetector:
             # 统计长度少 1 的数量
             return lengths.count(min_l) == 1
         return False
+        
+    def get_tip_bone(self, bone):
+        """递归获取骨骼链的最末端骨骼（始终取第一个子骨骼）"""
+        if not bone.children:
+            return bone
+        return self.get_tip_bone(bone.children[0])
 
     def detect_fingers(self, hand_bone, side_prefix):
         """识别拇指到小指及其三级骨骼链"""
-        fingers = hand_bone.children
+        fingers = [bone for bone in hand_bone.children if bone.children]
         if len(fingers) < 2: return
 
         # 计算空间距离跨度
-        heads = [f.head for f in fingers]
+        heads = [self.get_tip_bone(f).head for f in fingers]
         z_span = max(h.z for h in heads) - min(h.z for h in heads)
         y_span = max(h.y for h in heads) - min(h.y for h in heads)
 
         # 排序：Z轴大按 Z 排序，Y轴大按 Y 排序
         if z_span > y_span:
-            sorted_fingers = sorted(fingers, key=lambda b: b.head.z)
+            sorted_fingers = sorted(fingers, key=lambda b: self.get_tip_bone(b).head.z)
         else:
-            sorted_fingers = sorted(fingers, key=lambda b: b.head.y)
+            sorted_fingers = sorted(fingers, key=lambda b: self.get_tip_bone(b).head.y)
 
         # 映射规则：拇指到小指 [Thumb, Index, Middle, Ring, Little]
         finger_names = ["Thumb", "Index", "Middle", "Ring", "Little"]
@@ -747,8 +761,9 @@ class HumanoidAutoDetector:
         for i, b1 in enumerate(search_pool):
             for b2 in search_pool[i+1:]:
                 # 只有同一父级下的两个子骨骼名字符合 L/R 差异时才计入
-                if self.check_name_lr_diff(b1.name, b2.name):
-                    return b1, b2
+                order = self.check_name_lr_diff(b1.name, b2.name)
+                if order:
+                    return b1, b2 if order > 0 else b2, b1
                         
         return None, None
 
@@ -882,7 +897,10 @@ class HumanoidAutoDetector:
         # 逻辑：UpperChest 子骨骼中，名称类似且差异为 "l"/"left" 的为 LeftShoulder
         upper_chest_bone = self.bones.get(self.bone_map.get("UpperChest", ""))
         if upper_chest_bone:
-            l_shoulder, r_shoulder = self.find_lr_arm_pair_in_children(upper_chest_bone)
+            #l_shoulder, r_shoulder = self.find_lr_arm_pair_in_children(upper_chest_bone)
+            all_raw_pairs = self.find_all_lr_pairs_under(upper_chest_bone)
+            longest_lr_chains = self.filter_body_lr_pairs_by_chain_and_direction(all_raw_pairs)
+            l_shoulder, r_shoulder = longest_lr_chains[0]["pair"][0], longest_lr_chains[0]["pair"][1]
             if l_shoulder and r_shoulder:
                 # 判定 LeftShoulder (差异识别已在 find_lr_pair 处理)
                 self.bone_map["LeftShoulder"] = l_shoulder.name
@@ -914,7 +932,9 @@ class HumanoidAutoDetector:
                         # 逻辑：最长子链末端为 deform 且顶点 > 1 的为中指末端
                         full_arm_chain = self.get_longest_chain(l_upper_arm)
                         tip = full_arm_chain[-1]
-                        if tip.use_deform and self.get_vertex_count(tip.name) > 1:
+                        while tip and not (tip.use_deform and self.get_vertex_count(tip.name) > 1):
+                            tip = tip.parent
+                        if tip:
                             # 依次为：末端 -> 中间(Distal) -> 根部(Proximal) -> 手(Hand)
                             # 假设：Tip(Distal) -> Parent(Intermediate) -> Parent(Proximal) -> Parent(Hand)
                             p1 = tip.parent # Intermediate
@@ -1453,6 +1473,212 @@ class HUMANOID_OT_CopyRoll(Operator):
 
         self.report({'INFO'}, "已按层级顺序完成对齐")
         return {'FINISHED'}
+        
+# ---------------------------------------------------------
+# Target Armature Operator Helper logic
+# ---------------------------------------------------------
+
+class HUMANOID_OT_ApplyScale(Operator):
+    bl_idname = "humanoid.apply_scale"
+    bl_label = "Apply Target Scale"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        s = context.scene.humanoid_settings
+        dst = s.target_armature
+
+        if not dst:
+            self.report({'ERROR'}, "未指定目标骨架")
+            return {'CANCELLED'}
+
+        """
+        将缩放应用到骨架及其所有变形网格，保持当前形态。
+        等效于手动：应用网格的骨架修改器 -> 应用骨架缩放 -> 重新绑定修改器。
+        """
+        armature_obj = dst
+
+        # 收集所有受此骨架变形的网格对象
+        meshes = []
+        for obj in bpy.data.objects:
+            if obj.type == 'MESH':
+                for mod in obj.modifiers:
+                    if mod.type == 'ARMATURE' and mod.object == armature_obj:
+                        meshes.append(obj)
+                        break  # 一个网格可能有多个Armature修改器？这里只处理第一个
+
+        if not meshes:
+            print("没有找到使用此骨架变形的网格")
+            return
+
+        # 确保在对象模式，且当前活动对象为骨架
+        bpy.context.view_layer.objects.active = armature_obj
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        # 记录每个网格的修改器设置，并应用修改器
+        mod_settings = []
+        for mesh_obj in meshes:
+            # 查找第一个指向该骨架的Armature修改器
+            arm_mod = None
+            for mod in mesh_obj.modifiers:
+                if mod.type == 'ARMATURE' and mod.object == armature_obj:
+                    arm_mod = mod
+                    break
+            if not arm_mod:
+                continue
+
+            # 保存设置
+            settings = {
+                'name': arm_mod.name,
+                'use_vertex_groups': arm_mod.use_vertex_groups,
+                'use_bone_envelopes': arm_mod.use_bone_envelopes,
+                'vertex_group': arm_mod.vertex_group,
+                'invert_vertex_group': arm_mod.invert_vertex_group,
+                'use_deform_preserve_volume': arm_mod.use_deform_preserve_volume,
+                'show_in_editmode': arm_mod.show_in_editmode,
+                'show_on_cage': arm_mod.show_on_cage,
+            }
+            mod_settings.append((mesh_obj, settings))
+
+            # 应用修改器
+            bpy.context.view_layer.objects.active = mesh_obj
+            # 确保修改器在视口中可见且启用
+            arm_mod.show_viewport = True
+            arm_mod.show_render = True
+            try:
+                bpy.ops.object.modifier_apply(modifier=arm_mod.name)
+                print(f"已应用网格 '{mesh_obj.name}' 的修改器 '{arm_mod.name}'")
+                mesh_obj.select_set(True)
+                bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+            except Exception as e:
+                print(f"应用修改器失败: {e}")
+                # 可能由于修改器不在最顶层或其他原因，可尝试先移动到顶部？
+                # 但为了简单起见，报告错误并继续
+
+        # 应用骨架的缩放
+        bpy.context.view_layer.objects.active = armature_obj
+        bpy.ops.object.select_all(action='DESELECT')
+        armature_obj.select_set(True)
+        # 确保只应用缩放（位置、旋转保持）
+        bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+        print("已应用骨架的缩放")
+
+        # 重新添加修改器到每个网格
+        for mesh_obj, settings in mod_settings:
+            bpy.context.view_layer.objects.active = mesh_obj
+            new_mod = mesh_obj.modifiers.new(name=settings['name'], type='ARMATURE')
+            new_mod.object = armature_obj
+            # 恢复设置
+            new_mod.use_vertex_groups = settings['use_vertex_groups']
+            new_mod.use_bone_envelopes = settings['use_bone_envelopes']
+            new_mod.vertex_group = settings['vertex_group']
+            new_mod.invert_vertex_group = settings['invert_vertex_group']
+            new_mod.use_deform_preserve_volume = settings['use_deform_preserve_volume']
+            new_mod.show_in_editmode = settings['show_in_editmode']
+            new_mod.show_on_cage = settings['show_on_cage']
+            print(f"已重新绑定网格 '{mesh_obj.name}' 的修改器")
+
+        self.report({'INFO'}, "操作完成")
+        return {'FINISHED'}
+        
+class HUMANOID_OT_DeleteUnused(Operator):
+    bl_idname = "humanoid.delete_unused"
+    bl_label = "Delete Unused Bones"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    def get_deforming_meshes(self, armature_obj):
+        """返回所有受该骨架变形影响的网格对象"""
+        meshes = []
+        for obj in bpy.data.objects:
+            if obj.type == 'MESH':
+                for mod in obj.modifiers:
+                    if mod.type == 'ARMATURE' and mod.object == armature_obj:
+                        meshes.append(obj)
+                        break
+        return meshes
+
+    def has_vertex_weights(self, mesh_obj, vertex_group_name):
+        """检查指定顶点组是否有任何顶点权重"""
+        vg = mesh_obj.vertex_groups.get(vertex_group_name)
+        if not vg:
+            return False
+        # 遍历顶点检查是否被分配到此组
+        for v in mesh_obj.data.vertices:
+            for g in v.groups:
+                if g.group == vg.index and g.weight > 0:
+                    return True
+        return False
+
+    def bone_has_weights(self, armature_obj, bone_name, meshes):
+        """检查骨骼自身是否有顶点权重"""
+        for mesh in meshes:
+            if self.has_vertex_weights(mesh, bone_name):
+                return True
+        return False
+
+    def bone_or_descendants_have_weights(self, armature_obj, bone, meshes):
+        """递归检查骨骼及其所有后代是否有顶点权重"""
+        if self.bone_has_weights(armature_obj, bone.name, meshes):
+            return True
+        for child in bone.children:
+            if self.bone_or_descendants_have_weights(armature_obj, child, meshes):
+                return True
+        return False
+
+    def execute(self, context):
+        s = context.scene.humanoid_settings
+        dst = s.target_armature
+
+        if not dst:
+            self.report({'ERROR'}, "未指定目标骨架")
+            return {'CANCELLED'}
+
+        armature_obj = dst
+        meshes = self.get_deforming_meshes(armature_obj)
+
+        if not meshes:
+            print("没有找到使用此骨架的网格，未进行任何操作")
+            return {'CANCELLED'}
+
+        # 切换到编辑模式以访问编辑骨骼
+        bpy.context.view_layer.objects.active = armature_obj
+        bpy.ops.object.mode_set(mode='EDIT')
+        edit_bones = armature_obj.data.edit_bones
+
+        # 收集要删除的骨骼（自己及后代都无权重）
+        to_remove = []
+        for eb in edit_bones:
+            if not self.bone_or_descendants_have_weights(armature_obj, eb, meshes):
+                to_remove.append(eb.name)
+
+        if not to_remove:
+            print("所有骨骼均参与变形，无需删除")
+            bpy.ops.object.mode_set(mode='OBJECT')
+            return {'CANCELLED'}
+
+        print(f"将删除 {len(to_remove)} 根无用的骨骼链")
+
+        # 按深度从深到浅排序，避免删除父骨骼时子骨骼被意外重设父级
+        def get_depth(bone):
+            depth = 0
+            while bone.parent:
+                depth += 1
+                bone = bone.parent
+            return depth
+
+        to_remove_bones = [edit_bones[name] for name in to_remove]
+        to_remove_bones.sort(key=get_depth, reverse=True)
+
+        # 删除骨骼
+        for eb in to_remove_bones:
+            try:
+                edit_bones.remove(eb)
+            except Exception as e:
+                print(f"删除骨骼 {eb.name} 失败: {e}")
+
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        self.report({'INFO'}, "完成")
+        return {'FINISHED'}
 
 # ---------------------------------------------------------
 # JSON
@@ -1702,6 +1928,13 @@ class HUMANOID_PT_Main(Panel):
         col.operator("humanoid.copy_roll")
 
         col.separator()
+        
+        col.label(text="Retarget")
+        
+        col.operator("humanoid.apply_scale")
+        col.operator("humanoid.delete_unused")
+        
+        col.separator()
 
         col.label(text="Config")
 
@@ -1899,6 +2132,9 @@ classes = [
     HUMANOID_OT_AlignPose,
     HUMANOID_OT_ApplyRest,
     HUMANOID_OT_CopyRoll,
+
+    HUMANOID_OT_ApplyScale,
+    HUMANOID_OT_DeleteUnused,
 
     HUMANOID_OT_ExportSource,
     HUMANOID_OT_ImportSource,
