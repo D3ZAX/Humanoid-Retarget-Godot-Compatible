@@ -258,6 +258,41 @@ FINGER_CHAINS = [
 ]
 
 # ---------------------------------------------------------
+# utility
+# ---------------------------------------------------------
+
+def ultimate_visibility_check(obj):
+    print(f"自身 hide_viewport: {obj.hide_viewport}")
+    print(f"视图层对象 hide_viewport: {bpy.context.view_layer.objects.get(obj.name).hide_viewport if obj.name in bpy.context.view_layer.objects else '不存在'}")
+    print(f"局部视图模式: {bpy.context.space_data.local_view}")
+    print(f"最终 visible_get: {obj.visible_get()}")
+
+def make_object_visible_and_selectable(obj):
+    """确保在视口中可见且可被选择"""
+
+    ultimate_visibility_check(obj)
+    # 1. 强制在视口中显示（解除隐藏）
+    obj.hide_viewport = False   # 解除对象自身的视口隐藏
+    
+    if obj.hide_get():
+        obj.hide_set(False)
+    
+    # 2. 确保所在的集合可见（递归检查）
+    for collection in obj.users_collection:
+        collection.hide_viewport = False
+
+    # 3. 确保全局显示开启（找到3D视图空间设置）
+    for area in bpy.context.screen.areas:
+        if area.type == 'VIEW_3D':
+            space = area.spaces[0]
+            space.show_object_viewport_armature = True  # 显示
+            space.show_object_select_armature = True    # 允许选择
+            break
+
+    # 4. 最后，允许选择
+    obj.hide_select = False
+
+# ---------------------------------------------------------
 # name normalization
 # ---------------------------------------------------------
 
@@ -1079,6 +1114,7 @@ def apply_to_humanoid_settings(context, armature_obj, is_source=True, hip_bone_n
     detector = HumanoidAutoDetector(armature_obj)
     # 切换到编辑模式以读取坐标
     original_mode = armature_obj.mode
+    make_object_visible_and_selectable(armature_obj)
     bpy.context.view_layer.objects.active = armature_obj
     bpy.ops.object.mode_set(mode='EDIT')
     
@@ -1346,6 +1382,7 @@ class HUMANOID_OT_AlignPose(bpy.types.Operator):
         if not src or not dst:
             return {'CANCELLED'}
 
+        make_object_visible_and_selectable(dst)
         bpy.context.view_layer.objects.active = dst
         bpy.ops.object.mode_set(mode='POSE')
 
@@ -1383,11 +1420,13 @@ class HUMANOID_OT_ApplyRest(Operator):
         
         for mesh_obj, mod in affected_meshes:
             # 选中该 Mesh 设为活动对象
+            make_object_visible_and_selectable(mesh_obj)
             context.view_layer.objects.active = mesh_obj
             # 应用修改器（这会让模型顶点永久固定在当前姿态）
             bpy.ops.object.modifier_apply(modifier=mod.name)
             
         # 3. 应用骨架的 Pose 为 Rest Pose
+        make_object_visible_and_selectable(arm_obj)
         context.view_layer.objects.active = arm_obj
         bpy.ops.object.mode_set(mode='POSE')
         bpy.ops.pose.armature_apply()
@@ -1403,7 +1442,7 @@ class HUMANOID_OT_ApplyRest(Operator):
         self.report({'INFO'}, f"已同步 {len(affected_meshes)} 个模型的 Rest Pose")
         return {'FINISHED'}
 
-
+   
 class HUMANOID_OT_CopyRoll(Operator):
     bl_idname = "humanoid.copy_roll"
     bl_label = "Copy Bone Roll & Keep Children"
@@ -1424,6 +1463,7 @@ class HUMANOID_OT_CopyRoll(Operator):
         # --- 2. 准备源数据 ---
         src_bone_matrices = {}
         # 切换到源骨架取数据
+        make_object_visible_and_selectable(src)
         context.view_layer.objects.active = src
         bpy.ops.object.mode_set(mode='EDIT')
         for i in s.bone_items:
@@ -1432,6 +1472,7 @@ class HUMANOID_OT_CopyRoll(Operator):
                 src_bone_matrices[i.source] = sb.matrix.copy()
         
         # --- 3. 目标骨架操作 ---
+        make_object_visible_and_selectable(dst)
         context.view_layer.objects.active = dst
         bpy.ops.object.mode_set(mode='EDIT')
         
@@ -1463,6 +1504,9 @@ class HUMANOID_OT_CopyRoll(Operator):
                 # B. 对齐 Roll
                 src_x_axis = sb_matrix.to_3x3().col[0]
                 tb.align_roll(src_x_axis)
+                
+                sb = src.data.edit_bones.get(i.source)
+                tb.roll = sb.roll
 
         # 刷新并退出模式
         bpy.ops.object.mode_set(mode='OBJECT')
@@ -1473,9 +1517,55 @@ class HUMANOID_OT_CopyRoll(Operator):
 
         self.report({'INFO'}, "已按层级顺序完成对齐")
         return {'FINISHED'}
+
+# ---------------------------------------------------------
+# Optional Operation logic
+# ---------------------------------------------------------
+class HUMANOID_OT_AddCopyRotation(Operator):
+    bl_idname = "humanoid.add_copy_rotation"
+    bl_label = "Add Copy Rotation"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        s = context.scene.humanoid_settings
+        src = s.source_armature
+        dst = s.target_armature
+
+        if not src or not dst:
+            self.report({'ERROR'}, "未指定源或目标骨架")
+            return {'CANCELLED'}
+
+        # 确保当前活动对象是目标骨架，并切换到姿态模式 (Pose Mode)
+        make_object_visible_and_selectable(dst)
+        bpy.context.view_layer.objects.active = dst
+        bpy.ops.object.mode_set(mode='POSE')
+        
+        for i in s.bone_items:
+            sb = src.pose.bones.get(i.source)
+            tb = dst.pose.bones.get(i.target)
+            if sb and tb:
+                # 创建 'COPY_ROTATION' 约束
+                constraint = tb.constraints.new(type='COPY_ROTATION')
+                
+                # 设置约束的目标 (target) 为源骨架对象
+                constraint.target = src
+                # 设置子目标 (subtarget) 为源骨架中的同名骨骼
+                constraint.subtarget = sb.name
+                
+                # 设置坐标系为本地 (LOCAL)[reference:0]
+                constraint.target_space = 'LOCAL'
+                constraint.owner_space = 'LOCAL'
+                
+                print(f"已为 '{tb.name}' 添加约束")
+                
+        # 退出姿态模式
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        self.report({'INFO'}, "约束添加完成！")
+        return {'FINISHED'}
         
 # ---------------------------------------------------------
-# Target Armature Operator Helper logic
+# Target Armature Operation Helper logic
 # ---------------------------------------------------------
 
 class HUMANOID_OT_ApplyScale(Operator):
@@ -1511,6 +1601,7 @@ class HUMANOID_OT_ApplyScale(Operator):
             return
 
         # 确保在对象模式，且当前活动对象为骨架
+        make_object_visible_and_selectable(armature_obj)
         bpy.context.view_layer.objects.active = armature_obj
         bpy.ops.object.mode_set(mode='OBJECT')
 
@@ -1540,6 +1631,7 @@ class HUMANOID_OT_ApplyScale(Operator):
             mod_settings.append((mesh_obj, settings))
 
             # 应用修改器
+            make_object_visible_and_selectable(mesh_obj)
             bpy.context.view_layer.objects.active = mesh_obj
             # 确保修改器在视口中可见且启用
             arm_mod.show_viewport = True
@@ -1555,6 +1647,7 @@ class HUMANOID_OT_ApplyScale(Operator):
                 # 但为了简单起见，报告错误并继续
 
         # 应用骨架的缩放
+        make_object_visible_and_selectable(armature_obj)
         bpy.context.view_layer.objects.active = armature_obj
         bpy.ops.object.select_all(action='DESELECT')
         armature_obj.select_set(True)
@@ -1564,6 +1657,7 @@ class HUMANOID_OT_ApplyScale(Operator):
 
         # 重新添加修改器到每个网格
         for mesh_obj, settings in mod_settings:
+            make_object_visible_and_selectable(mesh_obj)
             bpy.context.view_layer.objects.active = mesh_obj
             new_mod = mesh_obj.modifiers.new(name=settings['name'], type='ARMATURE')
             new_mod.object = armature_obj
@@ -1640,6 +1734,7 @@ class HUMANOID_OT_DeleteUnused(Operator):
             return {'CANCELLED'}
 
         # 切换到编辑模式以访问编辑骨骼
+        make_object_visible_and_selectable(armature_obj)
         bpy.context.view_layer.objects.active = armature_obj
         bpy.ops.object.mode_set(mode='EDIT')
         edit_bones = armature_obj.data.edit_bones
@@ -1929,7 +2024,13 @@ class HUMANOID_PT_Main(Panel):
 
         col.separator()
         
-        col.label(text="Retarget")
+        col.label(text="Optional Operation")
+        
+        col.operator("humanoid.add_copy_rotation")
+        
+        col.separator()
+        
+        col.label(text="Target Operation")
         
         col.operator("humanoid.apply_scale")
         col.operator("humanoid.delete_unused")
@@ -2132,6 +2233,8 @@ classes = [
     HUMANOID_OT_AlignPose,
     HUMANOID_OT_ApplyRest,
     HUMANOID_OT_CopyRoll,
+    
+    HUMANOID_OT_AddCopyRotation,
 
     HUMANOID_OT_ApplyScale,
     HUMANOID_OT_DeleteUnused,
