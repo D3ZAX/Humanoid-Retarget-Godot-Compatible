@@ -13,6 +13,7 @@ import mathutils
 import re
 import os
 import difflib
+import uuid
 from bpy.props import *
 from bpy.types import Panel, Operator, PropertyGroup, UIList
 from bpy.app.handlers import persistent
@@ -1280,26 +1281,251 @@ class HUMANOID_OT_DetectTargetByHip(Operator):
 # Rename Operators
 # ---------------------------------------------------------
 
+def resolve_name_conflicts(armature, new_names, suffix="_ori"):
+    """
+    处理重命名前的名称冲突，返回需要应用的名称变更映射。
+    :param armature: 目标骨架对象
+    :param new_names: 需要检查的新名称集合
+    :param suffix: 冲突时添加的后缀
+    :return: 需要执行的名称变更映射 {原名称: 新名称}
+    """
+    if not armature or armature.type != 'ARMATURE':
+        return {}
+
+    existing_bones = set(armature.data.bones.keys())
+    new_names_set = set(new_names)
+    rename_map = {}  # 最终要应用的重命名映射
+    
+    # 需要处理编号后缀的正则，匹配 ".xxx" 格式（xxx 为数字）
+    number_suffix_pattern = re.compile(r'^(.+?)(\.\d+)$')
+
+    for bone_name in existing_bones:
+        # 检查当前骨骼名是否与任何一个新名称冲突
+        if bone_name in new_names_set:
+            new_name = f"{bone_name}{suffix}"
+            # 如果加后缀后仍然冲突，继续追加数字
+            counter = 1
+            base_new_name = new_name
+            while new_name in existing_bones or new_name in new_names_set or new_name in rename_map.values():
+                new_name = f"{base_new_name}_{counter}"
+                counter += 1
+            
+            rename_map[bone_name] = new_name
+            print(f"冲突处理: '{bone_name}' -> '{new_name}'")
+            continue
+        
+        # 检查是否有骨骼名以 "新名称.xxx" 的形式存在
+        match = number_suffix_pattern.match(bone_name)
+        if match:
+            base_name = match.group(1)
+            suffix_part = match.group(2)
+            if base_name in new_names_set:
+                new_name = f"{base_name}{suffix}{suffix_part}"
+                # 确保新名称也不冲突
+                counter = 1
+                base_new_name = new_name
+                while new_name in existing_bones or new_name in new_names_set or new_name in rename_map.values():
+                    new_name = f"{base_new_name}_{counter}"
+                    counter += 1
+                
+                rename_map[bone_name] = new_name
+                print(f"冲突处理(编号后缀): '{bone_name}' -> '{new_name}'")
+
+    return rename_map
+
+
+def build_final_rename_map(armature, rename_pairs, suffix="_ori"):
+    """
+    构建最终的重命名映射，解决所有冲突和顺序依赖问题。
+    :param armature: 目标骨架对象
+    :param rename_pairs: 列表，每个元素为 (旧名称, 新名称) 的元组
+    :param suffix: 冲突后缀
+    :return: 最终的重命名映射 {原名称: 最终名称}
+    """
+    if not armature or armature.type != 'ARMATURE':
+        return {}
+
+    existing_bones = set(armature.data.bones.keys())
+    
+    # 1. 收集所有目标新名称
+    target_new_names = [new_name for _, new_name in rename_pairs]
+    
+    # 2. 处理现有骨骼与目标新名称的冲突，得到第一批重命名映射
+    conflict_rename_map = resolve_name_conflicts(armature, target_new_names, suffix)
+    
+    # 3. 构建虚拟的骨骼名称状态（模拟应用冲突重命名后的状态）
+    virtual_bone_names = existing_bones.copy()
+    for old_name, new_name in conflict_rename_map.items():
+        virtual_bone_names.discard(old_name)
+        virtual_bone_names.add(new_name)
+    
+    # 4. 处理用户指定的重命名对，解决其中的冲突
+    final_rename_map = {}
+    # 记录已经被重命名映射占用的原始名称（防止循环依赖）
+    renamed_original_names = set()
+    
+    for old_name, desired_new_name in rename_pairs:
+        # 确定实际的原始名称：如果 old_name 在冲突重命名中被改了，我们需要追踪它的新名称
+        actual_old_name = old_name
+        
+        # 检查这个旧名称是否还存在于虚拟状态中
+        if old_name not in virtual_bone_names:
+            # 可能在冲突处理中被重命名了，尝试在冲突映射中找它的新名字
+            if old_name in conflict_rename_map:
+                actual_old_name = conflict_rename_map[old_name]
+            else:
+                print(f"警告: 骨骼 '{old_name}' 不存在，跳过")
+                continue
+        
+        # 确定最终的新名称
+        final_new_name = desired_new_name
+        
+        # 检查目标名称是否与虚拟状态中的其他骨骼冲突
+        # 注意：需要排除 actual_old_name 自身（如果新旧名称不同）
+        occupied_names = virtual_bone_names.copy()
+        if actual_old_name in occupied_names:
+            occupied_names.remove(actual_old_name)
+        
+        # 如果目标名称已被占用，生成唯一名称
+        if final_new_name in occupied_names or final_new_name in final_rename_map.values():
+            counter = 1
+            base_name = f"{final_new_name}{suffix}"
+            while base_name in occupied_names or base_name in final_rename_map.values():
+                base_name = f"{final_new_name}{suffix}_{counter}"
+                counter += 1
+            final_new_name = base_name
+            print(f"用户重命名冲突: '{old_name}' -> '{final_new_name}' (原目标: {desired_new_name})")
+        
+        # 记录映射
+        final_rename_map[old_name] = final_new_name
+        # 更新虚拟状态
+        virtual_bone_names.discard(actual_old_name)
+        virtual_bone_names.add(final_new_name)
+        renamed_original_names.add(old_name)
+        
+        if actual_old_name != old_name:
+            print(f"重命名: '{old_name}' (现名 '{actual_old_name}') -> '{final_new_name}'")
+        else:
+            print(f"重命名: '{old_name}' -> '{final_new_name}'")
+
+    # 5. 合并冲突重命名映射和用户重命名映射
+    # 注意：如果某个骨骼同时出现在两个映射中，以 final_rename_map 为准
+    all_rename_map = conflict_rename_map.copy()
+    all_rename_map.update(final_rename_map)
+    
+    return all_rename_map
+
+def apply_rename_map_safe(armature, rename_map):
+    """
+    安全地应用重命名映射，防止 Blender 自动追加 .001 后缀。
+    采用两阶段重命名策略：
+    1. 先将所有涉及的骨骼改为唯一的临时名称
+    2. 再将临时名称改为最终目标名称
+    """
+    if not rename_map:
+        return
+
+    bpy.context.view_layer.objects.active = armature
+    original_mode = bpy.context.mode
+    if original_mode != 'EDIT_ARMATURE':
+        bpy.ops.object.mode_set(mode='EDIT')
+
+    edit_bones = armature.data.edit_bones
+    
+    # 生成一个唯一的临时前缀
+    temp_prefix = f"__TEMP_{uuid.uuid4().hex[:8]}__"
+    
+    # 第一阶段：将所有需要重命名的骨骼改为临时名称
+    temp_map = {}  # {原名称: 临时名称}
+    for old_name in rename_map.keys():
+        bone = edit_bones.get(old_name)
+        if bone:
+            temp_name = f"{temp_prefix}{old_name}"
+            # 确保临时名称也不冲突（极不可能，但以防万一）
+            counter = 1
+            while temp_name in edit_bones:
+                temp_name = f"{temp_prefix}{old_name}_{counter}"
+                counter += 1
+            bone.name = temp_name
+            temp_map[old_name] = temp_name
+            print(f"阶段1: '{old_name}' -> '{temp_name}'")
+        else:
+            print(f"警告: 骨骼 '{old_name}' 不存在，跳过")
+    
+    # 第二阶段：将临时名称改为最终目标名称
+    for old_name, final_name in rename_map.items():
+        temp_name = temp_map.get(old_name)
+        if temp_name:
+            bone = edit_bones.get(temp_name)
+            if bone:
+                # 在改名前，检查最终名称是否已被占用（理论上不应该，但安全起见）
+                if final_name in edit_bones:
+                    # 如果被占用，说明映射表构建时有遗漏，需要重新生成唯一名称
+                    counter = 1
+                    base_name = final_name
+                    while final_name in edit_bones:
+                        final_name = f"{base_name}_{counter}"
+                        counter += 1
+                    print(f"警告: 最终名称冲突，调整为 '{final_name}'")
+                    # 更新映射表以便返回值正确
+                    rename_map[old_name] = final_name
+                
+                bone.name = final_name
+                print(f"阶段2: '{temp_name}' -> '{final_name}'")
+    
+    if original_mode != 'EDIT_ARMATURE':
+        bpy.ops.object.mode_set(mode='OBJECT')
+    
+    return rename_map  # 返回可能被调整后的映射
+
+
+def rename_bones_with_conflict_resolution(armature, rename_pairs, suffix="_ori"):
+    """
+    执行带冲突解决的重命名（完整流程）。
+    """
+    if not armature or armature.type != 'ARMATURE':
+        return {}
+
+    # 1. 构建最终的重命名映射
+    final_map = build_final_rename_map(armature, rename_pairs, suffix)
+    
+    # 2. 安全地应用映射
+    applied_map = apply_rename_map_safe(armature, final_map)
+    
+    return applied_map
+
+
 class HUMANOID_OT_RenameSourceToHumanoid(Operator):
 
     bl_idname = "humanoid.rename_source_humanoid"
     bl_label = "Rename Source To Humanoid"
 
-    def execute(self,context):
-
+    def execute(self, context):
         s = context.scene.humanoid_settings
         arm = s.source_armature
 
         if not arm:
+            self.report({'ERROR'}, "未指定目标骨架")
             return {'CANCELLED'}
 
+        # 构建重命名对
+        rename_pairs = []
         for i in s.bone_items:
+            if i.source and i.humanoid:
+                rename_pairs.append((i.source, i.humanoid))
 
-            if i.source in arm.data.bones:
+        if not rename_pairs:
+            return {'CANCELLED'}
 
-                arm.data.bones[i.source].name = i.humanoid
-                i.source = i.humanoid
+        # 执行带冲突处理的重命名
+        final_map = rename_bones_with_conflict_resolution(arm, rename_pairs)
 
+        # 更新 bone_items 中的 source 为最终名称
+        for i in s.bone_items:
+            if i.source in final_map:
+                i.source = final_map[i.source]
+
+        self.report({'INFO'}, f"已完成 {len(final_map)} 根骨骼的重命名")
         return {'FINISHED'}
 
 
@@ -1308,21 +1534,32 @@ class HUMANOID_OT_RenameTargetToHumanoid(Operator):
     bl_idname = "humanoid.rename_target_humanoid"
     bl_label = "Rename Target To Humanoid"
 
-    def execute(self,context):
-
+    def execute(self, context):
         s = context.scene.humanoid_settings
         arm = s.target_armature
 
         if not arm:
+            self.report({'ERROR'}, "未指定目标骨架")
             return {'CANCELLED'}
 
+        # 构建重命名对
+        rename_pairs = []
         for i in s.bone_items:
+            if i.target and i.humanoid:
+                rename_pairs.append((i.target, i.humanoid))
 
-            if i.target in arm.data.bones:
+        if not rename_pairs:
+            return {'CANCELLED'}
 
-                arm.data.bones[i.target].name = i.humanoid
-                i.target = i.humanoid
+        # 执行带冲突处理的重命名
+        final_map = rename_bones_with_conflict_resolution(arm, rename_pairs)
 
+        # 更新 bone_items 中的 target 为最终名称
+        for i in s.bone_items:
+            if i.target in final_map:
+                i.target = final_map[i.target]
+
+        self.report({'INFO'}, f"已完成 {len(final_map)} 根骨骼的重命名")
         return {'FINISHED'}
 
 
@@ -1336,13 +1573,28 @@ class HUMANOID_OT_SourceToTarget(Operator):
         s = context.scene.humanoid_settings
         arm = s.source_armature
 
+        if not arm:
+            self.report({'ERROR'}, "未指定目标骨架")
+            return {'CANCELLED'}
+
+        # 构建重命名对
+        rename_pairs = []
         for i in s.bone_items:
-
             if i.source and i.target:
+                rename_pairs.append((i.source, i.target))
 
-                arm.data.bones[i.source].name = i.target
-                i.source = i.target
+        if not rename_pairs:
+            return {'CANCELLED'}
 
+        # 执行带冲突处理的重命名
+        final_map = rename_bones_with_conflict_resolution(arm, rename_pairs)
+
+        # 更新 bone_items 中的 source 为最终名称
+        for i in s.bone_items:
+            if i.source in final_map:
+                i.source = final_map[i.source]
+
+        self.report({'INFO'}, f"已完成 {len(final_map)} 根骨骼的重命名")
         return {'FINISHED'}
 
 
@@ -1356,13 +1608,28 @@ class HUMANOID_OT_TargetToSource(Operator):
         s = context.scene.humanoid_settings
         arm = s.target_armature
 
+        if not arm:
+            self.report({'ERROR'}, "未指定目标骨架")
+            return {'CANCELLED'}
+
+        # 构建重命名对
+        rename_pairs = []
         for i in s.bone_items:
+            if i.target and i.source:
+                rename_pairs.append((i.target, i.source))
 
-            if i.source and i.target:
+        if not rename_pairs:
+            return {'CANCELLED'}
 
-                arm.data.bones[i.target].name = i.source
-                i.target = i.source
+        # 执行带冲突处理的重命名
+        final_map = rename_bones_with_conflict_resolution(arm, rename_pairs)
 
+        # 更新 bone_items 中的 target 为最终名称
+        for i in s.bone_items:
+            if i.target in final_map:
+                i.target = final_map[i.target]
+
+        self.report({'INFO'}, f"已完成 {len(final_map)} 根骨骼的重命名")
         return {'FINISHED'}
 
 
