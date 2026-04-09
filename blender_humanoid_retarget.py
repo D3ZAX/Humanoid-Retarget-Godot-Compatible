@@ -1049,9 +1049,23 @@ class HumanoidAutoDetector:
                             break
                     lr_pairs = self.find_all_lr_pairs_under(head_bone)
                     for l_bone, r_bone in lr_pairs:
-                        if "eye" in l_bone.name.lower():
+                        n_l = l_bone.name.lower()
+                        if "eye" in n_l and "lib" not in n_l and "brow" not in n_l:
                             self.bone_map["LeftEye"] = l_bone.name
                             self.bone_map["RightEye"] = r_bone.name
+                            if "root" in n_l:
+                                for child in l_bone.children:
+                                    n_l = child.name.lower()
+                                    if "eye" in n_l and "lib" not in n_l and "brow" not in n_l:
+                                        if "left" in n_l or n_l.startswith("l_") or n_l.endswith("_l"):
+                                            self.bone_map["LeftEye"] = child.name
+                                            break
+                                for child in r_bone.children:
+                                    n_l = child.name.lower()
+                                    if "eye" in n_l and "lib" not in n_l and "brow" not in n_l:
+                                        if "right" in n_l or n_l.startswith("r_") or n_l.endswith("_r"):
+                                            self.bone_map["RightEye"] = child.name
+                                            break
                             break
   
         #print(f"第五步结果：{self.bone_map}")
