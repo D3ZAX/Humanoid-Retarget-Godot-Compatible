@@ -586,9 +586,11 @@ class HumanoidAutoDetector:
             last = -1
             tip = f_chain[-1]
             len_chain = len(f_chain)
+
             while tip and not (tip.use_deform and self.get_vertex_count(tip.name) > 1):
                 last -= 1
                 tip = f_chain[last] if last >= -len_chain else None
+
             if tip:
                 # 按父子关系逆推三个等级
                 # 注意：拇指是 Metacarpal, Proximal, Distal; 其他是 Proximal, Intermediate, Distal
@@ -956,6 +958,14 @@ class HumanoidAutoDetector:
                         if len(b.children) >= 2:
                             chains = [self.get_longest_chain(c) for c in b.children]
                             lengths = [len(ch) for ch in chains]
+                            # 去除武器骨骼干扰
+                            while len(lengths) > 0 and lengths[-1] == 1:
+                                tip = chains[-1][0]
+                                if tip.use_deform and self.get_vertex_count(tip.name) > 1:
+                                    break
+                                else:
+                                    chains.pop()
+                                    lengths.pop()
                             # 条件：链长 >= 3 且 (长度相同 或 仅一个链长度少1)
                             if all(l >= 3 for l in lengths):
                                 if self.check_hand_chain_consistency(lengths):
