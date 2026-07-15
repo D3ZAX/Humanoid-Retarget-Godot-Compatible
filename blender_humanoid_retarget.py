@@ -658,6 +658,7 @@ class HumanoidAutoDetector:
         for key in leg_keys:
             if key in self.bone_map:
                 l_bone_name = self.bone_map[key]
+                print(f"key:{key} l_bone_name:{l_bone_name}")
                 # 尝试通过替换特征字符找到右侧对应的骨骼名
                 # 这里的逻辑是：找出 l_root 和 r_root 的差异点，应用到 l_bone_name 上
                 r_bone_name = self.find_matching_right_bone(l_name, r_name, l_bone_name)
@@ -811,6 +812,21 @@ class HumanoidAutoDetector:
             return [start_bone]
         chains = [self.get_longest_chain(c) for c in start_bone.children]
         return [start_bone] + max(chains, key=len)
+        
+    def get_most_longest_distance_chain(self, start_bone):
+        """获取最多骨骼的最长直线长度子链"""
+        if not start_bone.children:
+            return [start_bone]
+        chains = [self.get_longest_chain(c) for c in start_bone.children]
+        max_len = max(len(sub) for sub in chains)  # 先找到最大长度
+        result = [sub for sub in chains if len(sub) == max_len]  # 过滤出所有等于最大长度的
+        
+        if len(result) > 1:
+            chain = max(result, key=lambda x: (x[-1].head - x[0].head).length)
+        else:
+            chain = result[0]
+        
+        return [start_bone] + chain
 
     def execute_auto_detect(self, hip_bone_name=None):
         # 1. 寻找 Hips
@@ -883,14 +899,16 @@ class HumanoidAutoDetector:
                     chains = [self.get_longest_chain(c) for c in b.children]
                     lengths = [len(ch) for ch in chains]
                     # 逻辑判定：链长 >= 2 且长度全部相同
-                    if all(l >= 2 for l in lengths) and len(set(lengths)) == 1:
+                    len_type_num = len(set(lengths))
+                    if all(l >= 2 for l in lengths) and (len_type_num == 1 or len_type_num == 2) and len({tuple(sub) for sub in chains}) >= 3:
                         self.bone_map["LeftToes"] = b.name
+                        print(f"lefttoes:{b.name}")
                         found_toes = True
                         break
             
             # B. 若未找到 Foot，则寻找 LeftToes (最长子链最后一根为 deform 且顶点数 > 1)
             if not found_toes:
-                l_leg_chain = self.get_longest_chain(l_upper_leg)
+                l_leg_chain = self.get_most_longest_distance_chain(l_upper_leg)
                 if l_leg_chain:
                     last_bone = l_leg_chain[-1]
                     # 判定：是变形骨骼 且 控制顶点数 > 1
@@ -904,6 +922,7 @@ class HumanoidAutoDetector:
 
             # C. 寻找 LeftLowerLeg (处于 LeftUpperLeg 和 LeftFoot 之间)
             if found_toes:
+                print(self.bone_map["LeftToes"])
                 toes_bone = self.bones[self.bone_map["LeftToes"]]
                 if toes_bone.parent:
                     foot_bone = toes_bone.parent
@@ -1683,14 +1702,138 @@ class HUMANOID_OT_AlignPose(bpy.types.Operator):
         return {'FINISHED'}
 
 
+import bpy
+
+def apply_armature_modifier_with_shape_keys(context, mesh_obj, mod_name):
+    """
+    【全新 Blender 4.x+ 架构终极无损版】
+    保持原函数名不变。
+    彻底修复 'Mesh' object has no attribute 'calc_normals_split' 错误。
+    全面兼容新版法线机制，无损应用骨骼修改器并保留形态键、UV、自定义法线和所有属性。
+    """
+    if context.mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode='OBJECT')
+        
+    arm_mod = mesh_obj.modifiers.get(mod_name)
+    if not arm_mod or arm_mod.type != 'ARMATURE':
+        print(f"未找到骨骼修改器: {mod_name}")
+        return False
+
+    old_mesh = mesh_obj.data
+
+    # 1. 【适配新版法线】：安全备份最原始的自定义拆分法线数据
+    has_custom_normals = old_mesh.has_custom_normals
+    custom_loop_normals = []
+    if has_custom_normals:
+        # Blender 4.1+ 不再需要 calc_normals_split()，直接分配内存并高速读取
+        custom_loop_normals = [0.0] * (len(old_mesh.loops) * 3)
+        old_mesh.loops.foreach_get("normal", custom_loop_normals)
+
+    # 情况 A：没有形态键，直接调用原生 API（原生 API 处理单形态最安全）
+    if not old_mesh.shape_keys or not old_mesh.shape_keys.key_blocks:
+        bpy.ops.object.select_all(action='DESELECT')
+        mesh_obj.select_set(True)
+        context.view_layer.objects.active = mesh_obj
+        bpy.ops.object.modifier_apply(modifier=mod_name)
+        return True
+
+    # 情况 B：包含形态键 (新版克隆 + 法线无损重筑)
+    shape_keys = old_mesh.shape_keys.key_blocks
+    
+    # 2. 备份原形态键的面板参数配置
+    key_info = []
+    for key in shape_keys:
+        key_info.append({
+            'name': key.name,
+            'value': key.value,
+            'mute': key.mute,
+            'interpolation': key.interpolation,
+            'slider_min': key.slider_min,
+            'slider_max': key.slider_max
+        })
+    
+    # 3. 将所有形态键权值归零，避免互相干扰
+    for key in shape_keys:
+        key.value = 0.0
+        key.mute = False
+
+    # 4. 通过依赖图获取受骨骼修改器形变后的各形态键绝对顶点坐标
+    new_coords_per_key = {}
+    depsgraph = context.evaluated_depsgraph_get()
+
+    for info in key_info:
+        key_name = info['name']
+        if key_name != shape_keys[0].name:
+            shape_keys[key_name].value = 1.0
+            
+        context.view_layer.update()
+        
+        # 提取骨骼形变后的评估网格数据
+        obj_eval = mesh_obj.evaluated_get(depsgraph)
+        mesh_eval = obj_eval.data
+        
+        # 提取变形后的坐标
+        vert_count = len(mesh_eval.vertices)
+        coords = [0.0] * (vert_count * 3)
+        mesh_eval.vertices.foreach_get("co", coords)
+        new_coords_per_key[key_name] = coords
+        
+        if key_name != shape_keys[0].name:
+            shape_keys[key_name].value = 0.0
+
+    # 5. 全量复制原网格（克隆所有数据层：UV、顶点组、材质、自定义属性）
+    new_mesh = old_mesh.copy()
+    new_shape_keys = new_mesh.shape_keys.key_blocks
+
+    # 6. 将烘焙好的受骨骼形变后的新坐标，覆写到新网格的形态键通道中
+    for key_name, coords in new_coords_per_key.items():
+        kb = new_shape_keys.get(key_name)
+        if kb:
+            kb.data.foreach_set("co", coords)
+
+    # 7. 还原新网格中形态键的用户面板参数
+    for info in key_info:
+        kb = new_shape_keys.get(info['name'])
+        if kb:
+            kb.value = info['value']
+            kb.mute = info['mute']
+            kb.interpolation = info['interpolation']
+            kb.slider_min = info['slider_min']
+            kb.slider_max = info['slider_max']
+
+    # 8. 资产置换：将物体的网格数据指针指向全新的克隆网格
+    mesh_obj.data = new_mesh
+
+    # 9. 安全移除原骨骼修改器
+    arm_mod = mesh_obj.modifiers.get(mod_name)
+    if arm_mod:
+        mesh_obj.modifiers.remove(arm_mod)
+
+    # 10. 【新版法线注入修复】：在没有骨骼干扰的新网格上，强行重灌自定义拆分法线
+    if has_custom_normals and custom_loop_normals:
+        # 将一维 float 数组重组为新 API 所需的 (N, 3) 向量元组列表
+        normals_vec = [tuple(custom_loop_normals[i:i+3]) for i in range(0, len(custom_loop_normals), 3)]
+        # 覆写新网格的拆分法线
+        new_mesh.normals_split_custom_set(normals_vec)
+    else:
+        new_mesh.update()
+
+    # 11. 清理内存中被替换掉的旧孤立网格数据，防止内存泄漏
+    if old_mesh.users == 0:
+        bpy.data.meshes.remove(old_mesh)
+
+    # 12. 强行触发场景重绘与视图刷新
+    context.view_layer.update()
+    
+    return True
+
+
 class HUMANOID_OT_ApplyRest(Operator):
     bl_idname = "humanoid.apply_rest"
     bl_label = "Apply Rest Pose (Keep Mesh)"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        scene = context.scene
-        # 确保我们拿到的是当前的骨架
         arm_obj = context.active_object
         if not arm_obj or arm_obj.type != 'ARMATURE':
             self.report({'ERROR'}, "请选中一个骨架对象")
@@ -1705,35 +1848,62 @@ class HUMANOID_OT_ApplyRest(Operator):
                         affected_meshes.append((obj, mod))
                         break
 
-        # 2. 应用 Mesh 的修改器
-        # 我们需要先切回 Object 模式来应用修改器
-        bpy.ops.object.mode_set(mode='OBJECT')
-        
+        if not affected_meshes:
+            self.report({'WARNING'}, "未找到绑定此骨架的网格")
+            return {'CANCELLED'}
+
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        # 保存骨架名，防止后续意外发生
+        arm_name = arm_obj.name
+
+        # 2. 依次安全处理网格
         for mesh_obj, mod in affected_meshes:
-            # 选中该 Mesh 设为活动对象
-            make_object_visible_and_selectable(mesh_obj)
-            context.view_layer.objects.active = mesh_obj
-            # 应用修改器（这会让模型顶点永久固定在当前姿态）
-            bpy.ops.object.modifier_apply(modifier=mod.name)
+            mesh_obj.hide_viewport = False
+            mesh_obj.hide_select = False
+            mesh_obj.hide_set(False)
             
+            # 记录网格名称用作备用提示
+            mesh_name = mesh_obj.name
+            try:
+                apply_armature_modifier_with_shape_keys(context, mesh_obj, mod.name)
+            except Exception as e:
+                self.report({'ERROR'}, f"处理物体 '{mesh_name}' 时发生异常: {str(e)}")
+                return {'CANCELLED'}
+
+        # 重新获取骨架对象，防止因上游操作导致引用刷新失效
+        arm_obj = bpy.data.objects.get(arm_name)
+        if not arm_obj:
+            self.report({'ERROR'}, "骨架对象意外丢失")
+            return {'CANCELLED'}
+
         # 3. 应用骨架的 Pose 为 Rest Pose
-        make_object_visible_and_selectable(arm_obj)
+        arm_obj.hide_viewport = False
+        arm_obj.hide_select = False
+        bpy.ops.object.select_all(action='DESELECT')
+        arm_obj.select_set(True)
         context.view_layer.objects.active = arm_obj
+        context.view_layer.update()
+        
         bpy.ops.object.mode_set(mode='POSE')
         bpy.ops.pose.armature_apply()
         bpy.ops.object.mode_set(mode='OBJECT')
 
-        # 4. 重新为 Mesh 添加 Armature 修改器
+        # 4. 重新为 Mesh 添加 Armature 修改器重建绑定
         for mesh_obj, _ in affected_meshes:
-            new_mod = mesh_obj.modifiers.new(name="Armature", type='ARMATURE')
-            new_mod.object = arm_obj
-            new_mod.use_vertex_groups = True
-            # 如果你有特定的设置（如多层变形），可以在这里添加
+            # 同样通过名称重新安全获取物体，防止任何潜在的 ReferenceError
+            real_mesh = bpy.data.objects.get(mesh_obj.name)
+            if real_mesh:
+                new_mod = real_mesh.modifiers.new(name="Armature", type='ARMATURE')
+                new_mod.object = arm_obj
+                new_mod.use_vertex_groups = True
 
-        self.report({'INFO'}, f"已同步 {len(affected_meshes)} 个模型的 Rest Pose")
+        context.view_layer.objects.active = arm_obj
+        self.report({'INFO'}, f"已成功同步 {len(affected_meshes)} 个模型的 Rest Pose (完美保留 Shape Keys)")
         return {'FINISHED'}
 
-   
+
 class HUMANOID_OT_CopyRoll(Operator):
     bl_idname = "humanoid.copy_roll"
     bl_label = "Copy Bone Roll & Keep Children"
