@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Humanoid Retarget (Godot Compatible)",
     "author": "D3ZAX",
-    "version": (1,0,0),
+    "version": (1,0,1),
     "blender": (4,5,0),
     "location": "View3D > Sidebar > Humanoid",
     "category": "Animation"
@@ -1704,131 +1704,262 @@ class HUMANOID_OT_AlignPose(bpy.types.Operator):
 
 import bpy
 
-def apply_armature_modifier_with_shape_keys(context, mesh_obj, mod_name):
+# ---------------------------------------------------------
+# Apply Rest Pose (Keep Mesh) — 修复版
+# 修复: 形态键带驱动器/动画时, 烘焙被动画系统覆盖导致 shapekey 全部失效;
+#       网格基础顶点未同步; 其它修改器污染评估网格; 修改器设置丢失。
+# ---------------------------------------------------------
+def _mute_key_animation(shape_keys):
+    """临时静音形态键值上的全部动画来源（驱动器/动作曲线/NLA）。
+
+    返回恢复函数（无动画数据时返回 None）。
+    注意：Blender 4.4+ 中只要 Key 数据块上存在动画数据，求值就走动画系统缓存，
+    手动设置的 key.value 不会触发几何重算，必须配合 update_tag() 使用。
     """
-    【全新 Blender 4.x+ 架构终极无损版】
-    保持原函数名不变。
-    彻底修复 'Mesh' object has no attribute 'calc_normals_split' 错误。
-    全面兼容新版法线机制，无损应用骨骼修改器并保留形态键、UV、自定义法线和所有属性。
+    ad = getattr(shape_keys, "animation_data", None)
+    if not ad:
+        return None
+
+    fcurves = []
+    try:
+        for fcu in list(ad.drivers):
+            fcurves.append(fcu)
+    except Exception:
+        pass
+    action = getattr(ad, "action", None)
+    if action is not None:
+        try:
+            for fcu in action.fcurves:
+                fcurves.append(fcu)
+        except Exception:
+            pass
+    nla_tracks = []
+    try:
+        for track in ad.nla_tracks:
+            nla_tracks.append(track)
+    except Exception:
+        pass
+
+    if not fcurves and not nla_tracks:
+        return None
+
+    state = {"fcu": [(f, f.mute) for f in fcurves],
+             "nla": [(t, t.mute) for t in nla_tracks]}
+
+    for fcu, _ in state["fcu"]:
+        try:
+            fcu.mute = True
+        except Exception:
+            pass
+    for track, _ in state["nla"]:
+        try:
+            track.mute = True
+        except Exception:
+            pass
+
+    def _restore():
+        for fcu, was in state["fcu"]:
+            try:
+                fcu.mute = was
+            except Exception:
+                pass
+        for track, was in state["nla"]:
+            try:
+                track.mute = was
+            except Exception:
+                pass
+    return _restore
+
+
+def _write_baked_coords(mesh, bake_info):
+    """把烘焙好的坐标强制写入网格基础数据与形态键（幂等/纠偏两用）。"""
+    basis = bake_info.get("basis")
+    if basis is not None:
+        mesh.vertices.foreach_set("co", basis)
+    keys = bake_info.get("keys") or {}
+    if mesh.shape_keys:
+        for kb in mesh.shape_keys.key_blocks:
+            coords = keys.get(kb.name)
+            if coords is not None:
+                kb.data.foreach_set("co", coords)
+        mesh.shape_keys.update_tag()
+    mesh.update()
+
+
+def apply_armature_modifier_with_shape_keys(context, mesh_obj, mod_name):
+    """把骨骼修改器在当前 Pose 下的形变烘焙进网格与全部形态键，然后移除该修改器。
+
+    返回 dict {'settings':..., 'basis':[float], 'keys':{name:[float]}}，
+    供 `HUMANOID_OT_ApplyRest` 在 armature_apply 之后重建修改器并回写数据。
+    失败返回 None（此时保持原状，不移动修改器）。
     """
     if context.mode != 'OBJECT':
         bpy.ops.object.mode_set(mode='OBJECT')
-        
+
     arm_mod = mesh_obj.modifiers.get(mod_name)
     if not arm_mod or arm_mod.type != 'ARMATURE':
         print(f"未找到骨骼修改器: {mod_name}")
-        return False
+        return None
 
     old_mesh = mesh_obj.data
+    vert_count = len(old_mesh.vertices)
 
-    # 1. 【适配新版法线】：安全备份最原始的自定义拆分法线数据
+    # ---- 1. 备份骨骼修改器设置（之后按原样重建） ----
+    settings = {
+        'name': arm_mod.name,
+        'object': arm_mod.object,
+        'vertex_group': arm_mod.vertex_group,
+        'use_vertex_groups': arm_mod.use_vertex_groups,
+        'use_bone_envelopes': arm_mod.use_bone_envelopes,
+        'invert_vertex_group': arm_mod.invert_vertex_group,
+        'show_viewport': arm_mod.show_viewport,
+        'show_in_editmode': arm_mod.show_in_editmode,
+        'show_render': arm_mod.show_render,
+        'index': list(mesh_obj.modifiers).index(arm_mod),
+    }
+
+    # ---- 2. 备份自定义拆分法线 ----
     has_custom_normals = old_mesh.has_custom_normals
     custom_loop_normals = []
     if has_custom_normals:
-        # Blender 4.1+ 不再需要 calc_normals_split()，直接分配内存并高速读取
         custom_loop_normals = [0.0] * (len(old_mesh.loops) * 3)
         old_mesh.loops.foreach_get("normal", custom_loop_normals)
 
-    # 情况 A：没有形态键，直接调用原生 API（原生 API 处理单形态最安全）
+    # ---- 3. 无形态键：直接 modifier_apply，同样返回烘焙数据 ----
     if not old_mesh.shape_keys or not old_mesh.shape_keys.key_blocks:
         bpy.ops.object.select_all(action='DESELECT')
         mesh_obj.select_set(True)
         context.view_layer.objects.active = mesh_obj
         bpy.ops.object.modifier_apply(modifier=mod_name)
-        return True
-
-    # 情况 B：包含形态键 (新版克隆 + 法线无损重筑)
-    shape_keys = old_mesh.shape_keys.key_blocks
-    
-    # 2. 备份原形态键的面板参数配置
-    key_info = []
-    for key in shape_keys:
-        key_info.append({
-            'name': key.name,
-            'value': key.value,
-            'mute': key.mute,
-            'interpolation': key.interpolation,
-            'slider_min': key.slider_min,
-            'slider_max': key.slider_max
-        })
-    
-    # 3. 将所有形态键权值归零，避免互相干扰
-    for key in shape_keys:
-        key.value = 0.0
-        key.mute = False
-
-    # 4. 通过依赖图获取受骨骼修改器形变后的各形态键绝对顶点坐标
-    new_coords_per_key = {}
-    depsgraph = context.evaluated_depsgraph_get()
-
-    for info in key_info:
-        key_name = info['name']
-        if key_name != shape_keys[0].name:
-            shape_keys[key_name].value = 1.0
-            
+        basis = [0.0] * (len(old_mesh.vertices) * 3)
+        old_mesh.vertices.foreach_get("co", basis)
         context.view_layer.update()
-        
-        # 提取骨骼形变后的评估网格数据
-        obj_eval = mesh_obj.evaluated_get(depsgraph)
-        mesh_eval = obj_eval.data
-        
-        # 提取变形后的坐标
-        vert_count = len(mesh_eval.vertices)
-        coords = [0.0] * (vert_count * 3)
-        mesh_eval.vertices.foreach_get("co", coords)
-        new_coords_per_key[key_name] = coords
-        
-        if key_name != shape_keys[0].name:
-            shape_keys[key_name].value = 0.0
+        return {'settings': settings, 'basis': basis, 'keys': {}}
 
-    # 5. 全量复制原网格（克隆所有数据层：UV、顶点组、材质、自定义属性）
-    new_mesh = old_mesh.copy()
-    new_shape_keys = new_mesh.shape_keys.key_blocks
+    # ---- 4. 有形态键：逐键烘焙 ----
+    shape_keys = old_mesh.shape_keys
+    key_blocks = shape_keys.key_blocks
 
-    # 6. 将烘焙好的受骨骼形变后的新坐标，覆写到新网格的形态键通道中
-    for key_name, coords in new_coords_per_key.items():
-        kb = new_shape_keys.get(key_name)
-        if kb:
-            kb.data.foreach_set("co", coords)
+    key_info = []
+    for kb in key_blocks:
+        key_info.append({
+            'name': kb.name,
+            'value': kb.value,
+            'mute': kb.mute,
+        })
 
-    # 7. 还原新网格中形态键的用户面板参数
-    for info in key_info:
-        kb = new_shape_keys.get(info['name'])
-        if kb:
-            kb.value = info['value']
-            kb.mute = info['mute']
-            kb.interpolation = info['interpolation']
-            kb.slider_min = info['slider_min']
-            kb.slider_max = info['slider_max']
+    # 屏蔽其它修改器，确保评估网格只含 形态键+骨骼形变（顶点数不变）
+    other_mods = [m for m in mesh_obj.modifiers if m != arm_mod]
+    saved_show = [(m, m.show_viewport) for m in other_mods]
+    for m in other_mods:
+        m.show_viewport = False
 
-    # 8. 资产置换：将物体的网格数据指针指向全新的克隆网格
-    mesh_obj.data = new_mesh
+    basis_coords = None
+    new_coords_per_key = {}
+    anim_restore = None
 
-    # 9. 安全移除原骨骼修改器
-    arm_mod = mesh_obj.modifiers.get(mod_name)
-    if arm_mod:
-        mesh_obj.modifiers.remove(arm_mod)
+    def _refresh():
+        """标记 Key 数据块为脏并刷新依赖图。
 
-    # 10. 【新版法线注入修复】：在没有骨骼干扰的新网格上，强行重灌自定义拆分法线
+        关键点：Key 上存在动画数据（驱动器/动作）时，几何求值走动画系统缓存，
+        单纯改 key.value 不会触发重算，必须 update_tag() 强制标记。
+        """
+        shape_keys.update_tag()
+        context.view_layer.update()
+
+    try:
+        for kb in key_blocks:
+            kb.value = 0.0
+            kb.mute = False
+        _refresh()
+
+        depsgraph = context.evaluated_depsgraph_get()
+
+        # 探测驱动器/动画是否会在 depsgraph 求值时覆盖 value
+        probe_kbs = [kb for kb in key_blocks[1:]]
+        if probe_kbs:
+            probe_kb = probe_kbs[0]
+            probe_kb.value = 1.0
+            context.view_layer.update()  # 故意不加 tag：让驱动器把值写回去以便检测
+            if abs(probe_kb.value - 1.0) > 1e-6:
+                anim_restore = _mute_key_animation(shape_keys)
+                if anim_restore:
+                    for kb in key_blocks:
+                        kb.value = 0.0
+                    probe_kb.value = 1.0
+                    _refresh()
+                    if abs(probe_kb.value - 1.0) > 1e-6:
+                        raise RuntimeError(
+                            f"{mesh_obj.name}: 无法临时接管形态键 "
+                            f"'{probe_kb.name}' 的取值（动画干扰未能屏蔽）")
+            probe_kb.value = 0.0
+            _refresh()
+
+        # 逐键提取 "骨骼形变后的绝对坐标"
+        for info in key_info:
+            kb = key_blocks.get(info['name'])
+            if kb is None:
+                continue
+            is_basis = (kb is key_blocks[0])
+            if not is_basis:
+                kb.value = 1.0
+            _refresh()
+
+            obj_eval = mesh_obj.evaluated_get(depsgraph)
+            mesh_eval = obj_eval.data
+            ev_count = len(mesh_eval.vertices)
+            if ev_count != vert_count:
+                raise RuntimeError(
+                    f"{mesh_obj.name}: 评估网格顶点数不一致 "
+                    f"({ev_count} != {vert_count})，存在影响拓扑的修改器")
+            coords = [0.0] * (ev_count * 3)
+            mesh_eval.vertices.foreach_get("co", coords)
+            new_coords_per_key[info['name']] = coords
+
+            if not is_basis:
+                kb.value = 0.0
+
+        # ---- 5. 原地写回：网格基础顶点 + 全部形态键 ----
+        basis_coords = new_coords_per_key.get(key_blocks[0].name)
+        if basis_coords is not None:
+            old_mesh.vertices.foreach_set("co", basis_coords)
+        for info in key_info:
+            kb = key_blocks.get(info['name'])
+            if kb is not None and info['name'] in new_coords_per_key:
+                kb.data.foreach_set("co", new_coords_per_key[info['name']])
+
+        # ---- 6. 恢复形态键参数与动画 ----
+        for info in key_info:
+            kb = key_blocks.get(info['name'])
+            if kb is not None:
+                kb.value = info['value']
+                kb.mute = info['mute']
+        _refresh()
+
+    finally:
+        if anim_restore:
+            anim_restore()
+        for m, show in saved_show:
+            m.show_viewport = show
+        shape_keys.update_tag()
+        context.view_layer.update()
+
+    # ---- 7. 自定义拆分法线重灌 ----
     if has_custom_normals and custom_loop_normals:
-        # 将一维 float 数组重组为新 API 所需的 (N, 3) 向量元组列表
-        normals_vec = [tuple(custom_loop_normals[i:i+3]) for i in range(0, len(custom_loop_normals), 3)]
-        # 覆写新网格的拆分法线
-        new_mesh.normals_split_custom_set(normals_vec)
-    else:
-        new_mesh.update()
+        normals_vec = [tuple(custom_loop_normals[i:i + 3])
+                       for i in range(0, len(custom_loop_normals), 3)]
+        old_mesh.normals_split_custom_set(normals_vec)
+    old_mesh.update()
 
-    # 11. 清理内存中被替换掉的旧孤立网格数据，防止内存泄漏
-    if old_mesh.users == 0:
-        bpy.data.meshes.remove(old_mesh)
-
-    # 12. 强行触发场景重绘与视图刷新
+    # ---- 8. 移除骨骼修改器 ----
+    mesh_obj.modifiers.remove(arm_mod)
     context.view_layer.update()
-    
-    return True
+
+    return {'settings': settings, 'basis': basis_coords,
+            'keys': new_coords_per_key}
 
 
-class HUMANOID_OT_ApplyRest(Operator):
+class HUMANOID_OT_ApplyRest(bpy.types.Operator):
     bl_idname = "humanoid.apply_rest"
     bl_label = "Apply Rest Pose (Keep Mesh)"
     bl_options = {'REGISTER', 'UNDO'}
@@ -1852,58 +1983,73 @@ class HUMANOID_OT_ApplyRest(Operator):
             self.report({'WARNING'}, "未找到绑定此骨架的网格")
             return {'CANCELLED'}
 
-        if context.mode != 'OBJECT':
+        prev_mode = context.mode
+        if prev_mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
 
-        # 保存骨架名，防止后续意外发生
-        arm_name = arm_obj.name
-
-        # 2. 依次安全处理网格
+        # 2. 依次安全处理网格（烘焙 Pose 形变到网格+形态键）
+        baked_list = []
+        errors = []
         for mesh_obj, mod in affected_meshes:
             mesh_obj.hide_viewport = False
-            mesh_obj.hide_select = False
-            mesh_obj.hide_set(False)
-            
-            # 记录网格名称用作备用提示
-            mesh_name = mesh_obj.name
             try:
-                apply_armature_modifier_with_shape_keys(context, mesh_obj, mod.name)
-            except Exception as e:
-                self.report({'ERROR'}, f"处理物体 '{mesh_name}' 时发生异常: {str(e)}")
-                return {'CANCELLED'}
-
-        # 重新获取骨架对象，防止因上游操作导致引用刷新失效
-        arm_obj = bpy.data.objects.get(arm_name)
-        if not arm_obj:
-            self.report({'ERROR'}, "骨架对象意外丢失")
-            return {'CANCELLED'}
+                bake_info = apply_armature_modifier_with_shape_keys(
+                    context, mesh_obj, mod.name)
+            except Exception as ex:
+                errors.append(f"{mesh_obj.name}: {ex}")
+                continue
+            if bake_info is None:
+                errors.append(f"{mesh_obj.name}: 未找到骨骼修改器")
+                continue
+            baked_list.append((mesh_obj, bake_info))
 
         # 3. 应用骨架的 Pose 为 Rest Pose
-        arm_obj.hide_viewport = False
-        arm_obj.hide_select = False
         bpy.ops.object.select_all(action='DESELECT')
+        arm_obj.hide_viewport = False
         arm_obj.select_set(True)
         context.view_layer.objects.active = arm_obj
-        context.view_layer.update()
-        
         bpy.ops.object.mode_set(mode='POSE')
-        bpy.ops.pose.armature_apply()
+        bpy.ops.pose.armature_apply(selected=False)
         bpy.ops.object.mode_set(mode='OBJECT')
 
-        # 4. 重新为 Mesh 添加 Armature 修改器重建绑定
-        for mesh_obj, _ in affected_meshes:
-            # 同样通过名称重新安全获取物体，防止任何潜在的 ReferenceError
+        # 4. 重建骨骼修改器（按保存设置），并强制回写烘焙数据
+        #    （无论 armature_apply 是否自行形变了网格/形态键，回写后结果恒定正确）
+        for mesh_obj, bake_info in baked_list:
             real_mesh = bpy.data.objects.get(mesh_obj.name)
-            if real_mesh:
-                new_mod = real_mesh.modifiers.new(name="Armature", type='ARMATURE')
-                new_mod.object = arm_obj
-                new_mod.use_vertex_groups = True
+            if not real_mesh:
+                continue
+            st = bake_info['settings']
+            new_mod = real_mesh.modifiers.new(name=st['name'], type='ARMATURE')
+            new_mod.object = st['object'] if st['object'] else arm_obj
+            new_mod.vertex_group = st['vertex_group']
+            new_mod.use_vertex_groups = st['use_vertex_groups']
+            new_mod.use_bone_envelopes = st['use_bone_envelopes']
+            new_mod.invert_vertex_group = st['invert_vertex_group']
+            new_mod.show_viewport = st['show_viewport']
+            new_mod.show_in_editmode = st['show_in_editmode']
+            new_mod.show_render = st['show_render']
 
-        context.view_layer.objects.active = arm_obj
-        self.report({'INFO'}, f"已成功同步 {len(affected_meshes)} 个模型的 Rest Pose (完美保留 Shape Keys)")
+            # 恢复修改器在堆栈中的位置
+            try:
+                target_index = min(st['index'], len(real_mesh.modifiers) - 1)
+                with context.temp_override(object=real_mesh,
+                                           active_object=real_mesh,
+                                           selected_editable_objects=[real_mesh]):
+                    while list(real_mesh.modifiers).index(new_mod) > target_index:
+                        bpy.ops.object.modifier_move_up(modifier=new_mod.name)
+            except Exception:
+                pass
+
+            _write_baked_coords(real_mesh.data, bake_info)
+
+        context.view_layer.update()
+
+        if errors:
+            self.report({'WARNING'},
+                        f"部分网格处理失败: {'; '.join(errors)}")
+        self.report({'INFO'},
+                    f"已成功同步 {len(baked_list)} 个模型的 Rest Pose (完美保留 Shape Keys)")
         return {'FINISHED'}
-
-
 class HUMANOID_OT_CopyRoll(Operator):
     bl_idname = "humanoid.copy_roll"
     bl_label = "Copy Bone Roll & Keep Children"
