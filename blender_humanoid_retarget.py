@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Humanoid Retarget (Godot Compatible)",
     "author": "D3ZAX",
-    "version": (1,0,1),
+    "version": (1,0,2),
     "blender": (4,5,0),
     "location": "View3D > Sidebar > Humanoid",
     "category": "Animation"
@@ -388,7 +388,7 @@ class HumanoidAutoDetector:
                 continue
 
             # 找到左侧骨骼起始的最长合法链
-            l_chain = self._get_longest_valid_directional_chain(l_bone)
+            l_chain = self._get_longest_valid_directional_chain(l_bone, True)
             
             # 严格判定：链长必须 >= 3 才能保证至少有一次有效的连续点积计算
             # 只有一两个骨骼的链被视为“碎骨”，不具备肢体特征
@@ -405,7 +405,7 @@ class HumanoidAutoDetector:
 
         return scored_pairs
 
-    def _get_longest_valid_directional_chain(self, current_bone):
+    def _get_longest_valid_directional_chain(self, current_bone, current_as_root = False):
         """
         递归寻找从当前骨骼开始的最长合法方向链。
         如果在任何位置点积 <= 0，则该分支被截断。
@@ -417,7 +417,7 @@ class HumanoidAutoDetector:
             # 执行点积验证：爷爷->爸爸 dot 爸爸->儿子
             # 只有当爷爷存在时才计算，若不存在（根部）则默认通过
             is_directional_valid = True
-            if current_bone.parent:
+            if not current_as_root and current_bone.parent:
                 # 计算向量
                 v_parent = (current_bone.head - current_bone.parent.head).normalized()
                 v_child = (child.head - current_bone.head).normalized()
@@ -578,6 +578,7 @@ class HumanoidAutoDetector:
                     active_names.remove(to_remove)
                     break
 
+        
         # 遍历识别的手指
         for i, f_root in enumerate(sorted_fingers):
             f_type = active_names[i]
