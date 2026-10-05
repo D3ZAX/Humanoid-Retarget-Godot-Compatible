@@ -2161,7 +2161,7 @@ class HUMANOID_OT_AddCopyRotation(Operator):
                 constraint.subtarget = sb.name
                 
                 # 设置坐标系为本地 (LOCAL)[reference:0]
-                constraint.target_space = 'LOCAL'
+                constraint.target_space = 'LOCAL_OWNER_ORIENT'
                 constraint.owner_space = 'LOCAL'
                 
                 print(f"已为 '{tb.name}' 添加约束")
