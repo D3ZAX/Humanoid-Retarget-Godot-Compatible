@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Humanoid Retarget (Godot Compatible)",
     "author": "D3ZAX",
-    "version": (1,0,2),
+    "version": (1,1,0),
     "blender": (4,5,0),
     "location": "View3D > Sidebar > Humanoid",
     "category": "Animation"
