@@ -262,10 +262,16 @@ FINGER_CHAINS = [
 # utility
 # ---------------------------------------------------------
 
+def deselect_all_objects(context):
+    """用 Python 方式取消所有选择，不依赖 ops 的 poll 上下文"""
+    for obj in context.selected_objects:
+        obj.select_set(False)
+
 def ultimate_visibility_check(obj):
     print(f"自身 hide_viewport: {obj.hide_viewport}")
     print(f"视图层对象 hide_viewport: {bpy.context.view_layer.objects.get(obj.name).hide_viewport if obj.name in bpy.context.view_layer.objects else '不存在'}")
-    print(f"局部视图模式: {bpy.context.space_data.local_view}")
+    sd = getattr(bpy.context, "space_data", None)
+    print(f"局部视图模式: {getattr(sd, 'local_view', None) if sd else None}")
     print(f"最终 visible_get: {obj.visible_get()}")
 
 def make_object_visible_and_selectable(obj):
@@ -1959,6 +1965,24 @@ def apply_armature_modifier_with_shape_keys(context, mesh_obj, mod_name):
     return {'settings': settings, 'basis': basis_coords,
             'keys': new_coords_per_key}
 
+def add_local_copy_rotation_constraints(context, target_arm, source_arm,
+                                        ref_role="target", changing_role="source"):
+    """为 target_arm 的每个 humanoid 骨骼添加复制旋转约束，
+    复制 source_arm 中对应骨骼的旋转。
+    target_space = LOCAL_OWNER_ORIENT, owner_space = LOCAL"""
+    s = context.scene.humanoid_settings
+    for i in s.bone_items:
+        tb_name = getattr(i, ref_role)
+        sb_name = getattr(i, changing_role)
+        tb = target_arm.pose.bones.get(tb_name) if tb_name else None
+        sb = source_arm.pose.bones.get(sb_name) if sb_name else None
+        if sb and tb:
+            constraint = tb.constraints.new(type='COPY_ROTATION')
+            constraint.target = source_arm
+            constraint.subtarget = sb.name
+            constraint.target_space = 'LOCAL_OWNER_ORIENT'
+            constraint.owner_space = 'LOCAL'
+            print(f"已为 '{tb.name}' 添加约束 -> '{source_arm.name}:{sb.name}'")
 
 class HUMANOID_OT_ApplyRest(bpy.types.Operator):
     bl_idname = "humanoid.apply_rest"
@@ -2051,6 +2075,7 @@ class HUMANOID_OT_ApplyRest(bpy.types.Operator):
         self.report({'INFO'},
                     f"已成功同步 {len(baked_list)} 个模型的 Rest Pose (完美保留 Shape Keys)")
         return {'FINISHED'}
+
 class HUMANOID_OT_CopyRoll(Operator):
     bl_idname = "humanoid.copy_roll"
     bl_label = "Copy Bone Roll & Keep Children"
@@ -2127,7 +2152,7 @@ class HUMANOID_OT_CopyRoll(Operator):
         return {'FINISHED'}
 
 # ---------------------------------------------------------
-# Optional Operation logic
+# Constraints logic
 # ---------------------------------------------------------
 class HUMANOID_OT_AddCopyRotation(Operator):
     bl_idname = "humanoid.add_copy_rotation"
@@ -2138,40 +2163,151 @@ class HUMANOID_OT_AddCopyRotation(Operator):
         s = context.scene.humanoid_settings
         src = s.source_armature
         dst = s.target_armature
+        if not src or not dst:
+            self.report({'ERROR'}, "未指定源或目标骨架")
+            return {'CANCELLED'}
+        make_object_visible_and_selectable(dst)
+        bpy.context.view_layer.objects.active = dst
+        bpy.ops.object.mode_set(mode='POSE')
+        add_local_copy_rotation_constraints(context, dst, src, "target", "source")
+        bpy.ops.object.mode_set(mode='OBJECT')
+        self.report({'INFO'}, "约束添加完成！")
+        return {'FINISHED'}
+  
+class HUMANOID_OT_FullCopyConstraints(Operator):
+    bl_idname = "humanoid.full_copy_constraints"
+    bl_label = "Full Copy Constraints"
+    bl_options = {'REGISTER', 'UNDO'}
 
+    def execute(self, context):
+        s = context.scene.humanoid_settings
+        src = s.source_armature
+        dst = s.target_armature
         if not src or not dst:
             self.report({'ERROR'}, "未指定源或目标骨架")
             return {'CANCELLED'}
 
-        # 确保当前活动对象是目标骨架，并切换到姿态模式 (Pose Mode)
+        # ---------- 1. 复制 source 骨架 ----------
+        # 确保处于 OBJECT 模式（防止用户停在 POSE/EDIT 模式导致 poll 失败）
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        make_object_visible_and_selectable(src)
+        deselect_all_objects(context)                  # ← 替换 select_all
+        src.select_set(True)
+        context.view_layer.objects.active = src
+        bpy.ops.object.duplicate()
+        copy_arm = context.active_object
+        copy_arm.name = f"{src.name}_alignedto_{dst.name}"
+        copy_arm.data.name = copy_arm.name
+
+        # ---------- 2. 用与 align_pose 相同的逻辑，把复制骨架对齐到 target ----------
+        make_object_visible_and_selectable(copy_arm)
+        bpy.context.view_layer.objects.active = copy_arm
+        bpy.ops.object.mode_set(mode='POSE')
+        align_all(context, ref_arm=dst, changing_arm=copy_arm,
+                  ref_role="target", changing_role="source")
+
+        # ---------- 3. 应用复制骨架的 rest pose ----------
+        bpy.ops.object.mode_set(mode='OBJECT')
+        deselect_all_objects(context)                  # ← 替换
+        copy_arm.select_set(True)
+        context.view_layer.objects.active = copy_arm
+        bpy.ops.object.mode_set(mode='POSE')
+        bpy.ops.pose.armature_apply(selected=False)
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        hips_item = next((i for i in s.bone_items if i.humanoid == "Hips"), None)
+
+        def get_pose_bone(arm, item, role):
+            name = getattr(item, role)
+            return arm.pose.bones.get(name) if name else None
+
+        # ---------- 4. 为复制骨架添加约束（复制 source 同名骨骼） ----------
+        bpy.context.view_layer.objects.active = copy_arm
+        bpy.ops.object.mode_set(mode='POSE')
+        for i in s.bone_items:
+            cb = get_pose_bone(copy_arm, i, "source")
+            sb = get_pose_bone(src, i, "source")
+            if not (cb and sb):
+                continue
+            if i.humanoid == "Hips":
+                c = cb.constraints.new(type='COPY_TRANSFORMS')
+            else:
+                c = cb.constraints.new(type='COPY_ROTATION')
+            c.target = src
+            c.subtarget = sb.name
+            c.target_space = 'WORLD'
+            c.owner_space = 'WORLD'
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        # ---------- 5. target Hips 添加复制位置约束（复制复制骨架的 Hips） ----------
+        # ---------- 6. target 每个 humanoid 骨骼添加复制旋转约束（复制复制骨架，LOCAL） ----------
         make_object_visible_and_selectable(dst)
         bpy.context.view_layer.objects.active = dst
         bpy.ops.object.mode_set(mode='POSE')
-        
         for i in s.bone_items:
-            sb = src.pose.bones.get(i.source)
-            tb = dst.pose.bones.get(i.target)
-            if sb and tb:
-                # 创建 'COPY_ROTATION' 约束
-                constraint = tb.constraints.new(type='COPY_ROTATION')
-                
-                # 设置约束的目标 (target) 为源骨架对象
-                constraint.target = src
-                # 设置子目标 (subtarget) 为源骨架中的同名骨骼
-                constraint.subtarget = sb.name
-                
-                # 设置坐标系为本地 (LOCAL)[reference:0]
-                constraint.target_space = 'LOCAL_OWNER_ORIENT'
-                constraint.owner_space = 'LOCAL'
-                
-                print(f"已为 '{tb.name}' 添加约束")
-                
-        # 退出姿态模式
-        bpy.ops.object.mode_set(mode='OBJECT')
+            tb = get_pose_bone(dst, i, "target")
+            if not tb:
+                continue
+            if i.humanoid == "Hips" and hips_item:
+                cb = get_pose_bone(copy_arm, hips_item, "source")
+                if cb:
+                    c = tb.constraints.new(type='COPY_LOCATION')
+                    c.target = copy_arm
+                    c.subtarget = cb.name
+                    c.target_space = 'WORLD'
+                    c.owner_space = 'WORLD'
+            cb = get_pose_bone(copy_arm, i, "source")
+            if cb:
+                c = tb.constraints.new(type='COPY_ROTATION')
+                c.target = copy_arm
+                c.subtarget = cb.name
+                c.target_space = 'LOCAL_OWNER_ORIENT'
+                c.owner_space = 'LOCAL'
 
-        self.report({'INFO'}, "约束添加完成！")
+        # ---------- 7. 新建 cube: BodyZandFeetRotX ----------
+        bpy.ops.object.mode_set(mode='OBJECT')
+        bpy.ops.mesh.primitive_cube_add(size=0.2)
+        cube = context.active_object
+        cube.name = "BodyZandFeetRotX"
+
+        # ---------- 8. target Hips 复制 cube 的 Z 轴位置（WORLD，offset 开启） ----------
+        make_object_visible_and_selectable(dst)          # ← 新增
+        bpy.context.view_layer.objects.active = dst      # ← 新增：把活动对象切回 target 骨架
+        bpy.ops.object.mode_set(mode='POSE')
+        if hips_item:
+            tb_hips = get_pose_bone(dst, hips_item, "target")
+            if tb_hips:
+                c = tb_hips.constraints.new(type='COPY_LOCATION')
+                c.target = cube
+                c.use_x = False
+                c.use_y = False
+                c.use_z = True
+                c.target_space = 'WORLD'
+                c.owner_space = 'WORLD'
+                c.use_offset = True
+
+        # ---------- 9. 左右脚复制 cube 的 X 轴（WORLD -> LOCAL，mix=add） ----------
+        for human_name in ("LeftFoot", "RightFoot"):
+            item = next((i for i in s.bone_items if i.humanoid == human_name), None)
+            if not item:
+                continue
+            tb = get_pose_bone(dst, item, "target")
+            if tb:
+                c = tb.constraints.new(type='COPY_ROTATION')
+                c.target = cube
+                c.use_x = True
+                c.use_y = False
+                c.use_z = False
+                c.target_space = 'WORLD'
+                c.owner_space = 'LOCAL'
+                c.mix_mode = 'ADD'
+
+        bpy.ops.object.mode_set(mode='OBJECT')
+        context.view_layer.update()
+        self.report({'INFO'}, f"完全复制约束完成: {copy_arm.name}")
         return {'FINISHED'}
-        
+  
 # ---------------------------------------------------------
 # Target Armature Operation Helper logic
 # ---------------------------------------------------------
@@ -2632,9 +2768,10 @@ class HUMANOID_PT_Main(Panel):
 
         col.separator()
         
-        col.label(text="Optional Operation")
+        col.label(text="Constraints")
         
         col.operator("humanoid.add_copy_rotation")
+        col.operator("humanoid.full_copy_constraints")
         
         col.separator()
         
@@ -2652,172 +2789,154 @@ class HUMANOID_PT_Main(Panel):
         col.operator("humanoid.export_target")
         col.operator("humanoid.import_target")
 
-def align_bone_direction(context, bone_humanoid_a, bone_humanoid_b):
-    humanoid_settings = context.scene.humanoid_settings
-    src_arm = humanoid_settings.source_armature
-    dst_arm = humanoid_settings.target_armature
+def _get_pose_bone_by_role(arm, item, role):
+    """role: 'source' 或 'target'，根据骨架在该映射中的角色取对应的姿态骨骼"""
+    if not arm or not item:
+        return None
+    name = getattr(item, role)
+    return arm.pose.bones.get(name) if name else None
 
-    # 获取骨骼
+def _resolve_role(humanoid_settings, ref_arm, changing_arm):
+    s = humanoid_settings
+    if ref_arm == s.source_armature and changing_arm == s.target_armature:
+        return "source", "target"
+    elif ref_arm == s.target_armature and changing_arm == s.source_armature:
+        return "target", "source"
+    else:
+        return None, None
+
+def align_bone_direction(context, bone_humanoid_a, bone_humanoid_b,
+                         ref_arm=None, changing_arm=None,
+                         ref_role="source", changing_role="target"):
+    humanoid_settings = context.scene.humanoid_settings
+    src_arm = ref_arm or humanoid_settings.source_armature
+    dst_arm = changing_arm or humanoid_settings.target_armature
+    # 若能从 settings 推断角色（普通 source<->target 情况），则用推断结果；
+    # 否则（如复制骨架）使用调用方显式传入的角色
+    r = _resolve_role(humanoid_settings, src_arm, dst_arm)
+    if r[0]:
+        ref_key, changing_key = r
+    else:
+        ref_key, changing_key = ref_role, changing_role
+    if not ref_key:
+        print("align_bone_direction: 骨架角色无法确定，跳过")
+        return
+
     bone_item_a = next((i for i in humanoid_settings.bone_items if i.humanoid == bone_humanoid_a), None)
     bone_item_b = next((i for i in humanoid_settings.bone_items if i.humanoid == bone_humanoid_b), None)
-
-    if bone_item_a == None or bone_item_a.source == None or bone_item_a.target == None or bone_item_b == None or bone_item_b.source == None or bone_item_b.target == None:
+    if not bone_item_a or not bone_item_b:
         return
-    
-    src_a = src_arm.pose.bones.get(bone_item_a.source)
-    src_b = src_arm.pose.bones.get(bone_item_b.source)
-    dst_a = dst_arm.pose.bones.get(bone_item_a.target)
-    dst_b = dst_arm.pose.bones.get(bone_item_b.target)
+    src_a = _get_pose_bone_by_role(src_arm, bone_item_a, ref_key)
+    src_b = _get_pose_bone_by_role(src_arm, bone_item_b, ref_key)
+    dst_a = _get_pose_bone_by_role(dst_arm, bone_item_a, changing_key)
+    dst_b = _get_pose_bone_by_role(dst_arm, bone_item_b, changing_key)
+    if not all([src_a, src_b, dst_a, dst_b]):
+        return
 
-    # 1. 计算当前的向量方向
     src_dir = (src_b.head - src_a.head).normalized()
     dst_dir_before = (dst_b.head - dst_a.head).normalized()
-
     print("="*50)
     print(f"对齐：{bone_humanoid_a} -> {bone_humanoid_b}")
 
-    # 2. 计算骨架空间旋转增量 q
     q_diff_arm = dst_dir_before.rotation_difference(src_dir)
 
-    # 3. 构造目标的【骨架空间矩阵】 (Matrix Armature)
-    # 保持 A 的位置和缩放，只应用旋转增量
     old_loc = dst_a.matrix.to_translation()
     old_scale = dst_a.matrix.to_scale()
     new_rot_mtx = q_diff_arm.to_matrix() @ dst_a.matrix.to_3x3()
-    
     target_matrix_arm = Matrix.LocRotScale(old_loc, new_rot_mtx, old_scale)
 
-    # 4. 核心转换：Armature Space -> Pose Space (matrix_basis)
-    # 根据 Blender 文档，pose_bone.matrix = parent.matrix @ bone.matrix_local.relative @ matrix_basis
-    # 我们推导 matrix_basis 的唯一可靠方式是：
     if dst_a.parent:
-        # 获取 A 的 Edit Bone 相对于父级 Edit Bone 的矩阵 (Rest Pose 局部矩阵)
-        # 公式：M_Edit_Local = Parent_Edit_Global_Inv @ Child_Edit_Global
         m_edit_local = dst_a.parent.bone.matrix_local.inverted() @ dst_a.bone.matrix_local
-        
-        # 计算当前的 Pose 局部矩阵
-        # 公式：M_Basis = (Parent_Pose_Global @ M_Edit_Local).inverted() @ Target_Pose_Global
         new_matrix_basis = (dst_a.parent.matrix @ m_edit_local).inverted() @ target_matrix_arm
     else:
-        # 如果没有父级，直接抵消 Edit Mode 的全局偏移
         new_matrix_basis = dst_a.bone.matrix_local.inverted() @ target_matrix_arm
 
-    # 5. 应用旋转到四元数
     dst_a.rotation_mode = 'QUATERNION'
     dst_a.rotation_quaternion = new_matrix_basis.to_quaternion()
-
-    # 必须更新，否则后续计算或日志获取的坐标是旧的
     context.view_layer.update()
 
-    # --- 打印日志 ---
     dst_dir_after = (dst_b.head - dst_a.head).normalized()
-    print(f"[源方向]       {src_dir}")
-    print(f"[目标方向-后]  {dst_dir_after}")
-    print(f"[误差距离]     {(src_dir - dst_dir_after).length:.8f}")
+    print(f"[源方向] {src_dir}")
+    print(f"[目标方向-后] {dst_dir_after}")
+    print(f"[误差距离] {(src_dir - dst_dir_after).length:.8f}")
     print("="*50)
 
-def align_hand_chain(context, bone_humanoid_a, bone_humanoid_b, bone_humanoid_c, bone_humanoid_d):
-    """
-    手部骨骼链对齐：
-    A -> 旋转中心 (如肩/大臂/手腕)
-    B -> 目标指向点 (如肘/前臂/中指根)
-    C -> 弯曲参考点 (如手肘/相邻手指) 用于确定旋转平面（Roll）
-    """
+def align_hand_chain(context, bone_humanoid_a, bone_humanoid_b,
+                     bone_humanoid_c, bone_humanoid_d,
+                     ref_arm=None, changing_arm=None,
+                     ref_role="source", changing_role="target"):
     humanoid_settings = context.scene.humanoid_settings
-    src_arm = humanoid_settings.source_armature
-    dst_arm = humanoid_settings.target_armature
-    
-    if not src_arm or not dst_arm:
+    src_arm = ref_arm or humanoid_settings.source_armature
+    dst_arm = changing_arm or humanoid_settings.target_armature
+    r = _resolve_role(humanoid_settings, src_arm, dst_arm)
+    if r[0]:
+        ref_key, changing_key = r
+    else:
+        ref_key, changing_key = ref_role, changing_role
+    if not ref_key:
         return
-    
-    # 1. 获取映射项
+
     bone_item_a = next((i for i in humanoid_settings.bone_items if i.humanoid == bone_humanoid_a), None)
     bone_item_b = next((i for i in humanoid_settings.bone_items if i.humanoid == bone_humanoid_b), None)
     bone_item_c = next((i for i in humanoid_settings.bone_items if i.humanoid == bone_humanoid_c), None)
-    
     if not (bone_item_a and bone_item_b and bone_item_c):
         return
-    
-    # 2. 获取 PoseBone (必须用 PoseBone 才能拿到当前实时的 head 坐标)
-    psrcA = src_arm.pose.bones.get(bone_item_a.source)
-    psrcB = src_arm.pose.bones.get(bone_item_b.source)
-    psrcC = src_arm.pose.bones.get(bone_item_c.source)
-    
-    pdstA = dst_arm.pose.bones.get(bone_item_a.target)
-    pdstB = dst_arm.pose.bones.get(bone_item_b.target)
-    pdstC = dst_arm.pose.bones.get(bone_item_c.target)
 
+    psrcA = _get_pose_bone_by_role(src_arm, bone_item_a, ref_key)
+    psrcB = _get_pose_bone_by_role(src_arm, bone_item_b, ref_key)
+    psrcC = _get_pose_bone_by_role(src_arm, bone_item_c, ref_key)
+    pdstA = _get_pose_bone_by_role(dst_arm, bone_item_a, changing_key)
+    pdstB = _get_pose_bone_by_role(dst_arm, bone_item_b, changing_key)
+    pdstC = _get_pose_bone_by_role(dst_arm, bone_item_c, changing_key)
     if not all([psrcA, psrcB, psrcC, pdstA, pdstB, pdstC]):
         return
 
-    # -------------------------- 核心逻辑：构造源骨骼的目标矩阵 --------------------------
-    # 在骨架空间构造一个理想的 3x3 矩阵
-    # Y轴：A指向B (Blender骨骼主轴是Y)
-    # X轴/Z轴：由 A-B 和 A-C 构成的平面决定
-    
+    # ---- 与原版完全一致的矩阵构造（只用 A、B、C）----
     def get_align_matrix(pA, pB, pC):
-        dir_y = (pB.head - pA.head).normalized()  # 主轴
+        dir_y = (pB.head - pA.head).normalized()
         dir_temp = (pC.head - pA.head).normalized()
-        
-        # 叉乘得到侧轴
         dir_x = dir_temp.cross(dir_y).normalized()
         dir_z = dir_y.cross(dir_x).normalized()
-        
-        # 构造 3x3 矩阵 (列向量排列)
         return Matrix((dir_x, dir_y, dir_z)).transposed()
 
-    # 源骨骼当前的理想世界(骨架)旋转
     src_rot_arm = get_align_matrix(psrcA, psrcB, psrcC)
-    
-    # 目标骨骼当前的理想世界(骨架)旋转
     dst_rot_arm_current = get_align_matrix(pdstA, pdstB, pdstC)
-    
-    # 计算从“当前目标旋转”到“源旋转”的偏差
-    # q_diff * dst_rot = src_rot  =>  q_diff = src_rot * dst_rot_inv
+
     q_diff_arm = src_rot_arm @ dst_rot_arm_current.inverted()
 
-    # -------------------------- 空间转换与应用 --------------------------
-    # 构造目标 4x4 矩阵 (保持位置不动)
     target_matrix_arm = q_diff_arm.to_4x4() @ pdstA.matrix
-
-    # 关键：应用我们在单根骨骼对齐中成功的“公式”
-    # 抵消父级姿态和自身 Edit Mode (Rest Pose) 的基准
     if pdstA.parent:
-        # 计算相对于父级的 Edit 偏移
         m_edit_local = pdstA.parent.bone.matrix_local.inverted() @ pdstA.bone.matrix_local
-        # 转回 Pose Basis 空间
         new_matrix_basis = (pdstA.parent.matrix @ m_edit_local).inverted() @ target_matrix_arm
     else:
         new_matrix_basis = pdstA.bone.matrix_local.inverted() @ target_matrix_arm
 
-    # 写入旋转
     pdstA.rotation_mode = 'QUATERNION'
     pdstA.rotation_quaternion = new_matrix_basis.to_quaternion()
-
-    # 刷新
     context.view_layer.update()
-    
     print(f"链式对齐完成: {bone_humanoid_a}")
 
-def align_all(context):
-    # 从context获取humanoid设置
+def align_all(context, ref_arm=None, changing_arm=None,
+              ref_role="source", changing_role="target"):
     humanoid_settings = context.scene.humanoid_settings
-    src = humanoid_settings.source_armature
-    dst = humanoid_settings.target_armature
-    
+    src = ref_arm or humanoid_settings.source_armature
+    dst = changing_arm or humanoid_settings.target_armature
     if not src or not dst:
         return
-
     for chain in BODY_CHAINS:
         for i in range(len(chain)-1):
-            align_bone_direction(context, chain[i], chain[i+1])
-    
+            align_bone_direction(context, chain[i], chain[i+1],
+                                 ref_arm=src, changing_arm=dst,
+                                 ref_role=ref_role, changing_role=changing_role)
     for chain in HAND_CHAINS:
-        align_hand_chain(context, *chain)
-    
+        align_hand_chain(context, *chain,
+                         ref_arm=src, changing_arm=dst,
+                         ref_role=ref_role, changing_role=changing_role)
     for chain in FINGER_CHAINS:
         for i in range(len(chain)-1):
-            align_bone_direction(context, chain[i], chain[i+1])
+            align_bone_direction(context, chain[i], chain[i+1],
+                                 ref_arm=src, changing_arm=dst,
+                                 ref_role=ref_role, changing_role=changing_role)
 
 # ---------------------------------------------------------
 # register
@@ -2843,6 +2962,7 @@ classes = [
     HUMANOID_OT_CopyRoll,
     
     HUMANOID_OT_AddCopyRotation,
+    HUMANOID_OT_FullCopyConstraints,
 
     HUMANOID_OT_ApplyScale,
     HUMANOID_OT_DeleteUnused,
